@@ -22,9 +22,16 @@ http_probe() {
 }
 
 parse_timestamp_epoch() {
-  local timestamp="$1"
+  local timestamp="$1" normalized=""
 
-  "${JQ_BIN:-$(command -v jq)}" -nr --arg ts "$timestamp" 'try ($ts | sub("\\.[0-9]+Z$"; "Z") | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) catch empty'
+  normalized="$(printf '%s' "$timestamp" | sed -E 's/\.[0-9]+([Z+-])/\1/; s/([+-][0-9]{2}):([0-9]{2})$/\1\2/')"
+
+  if [[ "$normalized" == *Z ]]; then
+    date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$normalized" '+%s' 2>/dev/null || true
+    return 0
+  fi
+
+  date -j -f '%Y-%m-%dT%H:%M:%S%z' "$normalized" '+%s' 2>/dev/null || true
 }
 
 probe_emit() {

@@ -161,6 +161,35 @@ test('probe: returns ok for healthy Hermes contract', () => {
   assert.equal(output.trim(), 'ok|ok');
 });
 
+test('probe: accepts Hermes offset timestamps in gateway_state.json', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-watchdog-offset-ts-'));
+  const offsetPath = path.join(tempDir, 'gateway_state.json');
+  const offsetTs = new Date().toISOString().replace('Z', '+00:00');
+  writeJson(offsetPath, {
+    gateway_state: 'running',
+    updated_at: offsetTs,
+    platforms: { feishu: { state: 'connected' } },
+  });
+
+  const output = runProbe(`
+    source "${corePath}"
+    log() { :; }
+    JQ_BIN="$(command -v jq)"
+    CURRENT_GATEWAY_PID=111
+    CURRENT_CLOUDFLARED_PID=222
+    gateway_state_file_path() { printf '%s\\n' "${offsetPath}"; }
+    check_gateway_listener() { return 0; }
+    http_probe() {
+      case "$1" in
+        *"/ready") printf '200\\t%s\\n' "$(cat "${healthyReadyPath}")" ;;
+        *"/feishu/webhook") printf '405\\t{}\\n' ;;
+      esac
+    }
+  `);
+
+  assert.equal(output.trim(), 'ok|ok');
+});
+
 test('probe: returns fail when gateway_state.json is stale', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-watchdog-stale-'));
   const stalePath = path.join(tempDir, 'gateway_state.json');
