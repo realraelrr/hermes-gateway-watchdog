@@ -96,17 +96,19 @@ test('launchd: install script derives Hermes paths from repo root and default ho
   assert.match(installLaunchAgent, /REPO_ROOT="\$\(cd "\$SCRIPT_DIR\/\.\." && pwd\)"/);
   assert.match(installLaunchAgent, /HERMES_HOME="\$\{HERMES_HOME:-\$HOME\/\.hermes\}"/);
   assert.match(installLaunchAgent, /WATCHDOG_HOME="\$\{WATCHDOG_HOME:-\$HOME\/\.hermes-watchdog\}"/);
+  assert.match(installLaunchAgent, /WATCHDOG_RUNTIME_DIR="\$\{WATCHDOG_RUNTIME_DIR:-\$WATCHDOG_HOME\/runtime\/current\}"/);
   assert.match(installLaunchAgent, /WATCHDOG_ENV_FILE="\$\{WATCHDOG_ENV_FILE:-\$WATCHDOG_HOME\/config\/watchdog\.env\}"/);
   assert.match(installLaunchAgent, /ai\.hermes\.gateway-watchdog/);
 });
 
-test('launchd: install script renders plist and invokes launchctl bootstrap flow with derived paths', () => {
+test('launchd: install script stages a local runtime copy, renders plist, and invokes launchctl bootstrap flow', () => {
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'watchdog-launchd-home-'));
   const fakeBinDir = fs.mkdtempSync(path.join(os.tmpdir(), 'watchdog-launchd-bin-'));
   const callsFile = path.join(tempHome, 'launchctl.calls');
   const expectedEnvFile = path.join(tempHome, '.hermes-watchdog', 'config', 'watchdog.env');
   const expectedLogFile = path.join(tempHome, '.hermes-watchdog', 'logs', 'gateway-watchdog.log');
   const expectedHermesHome = path.join(tempHome, '.hermes');
+  const expectedRuntimeDir = path.join(tempHome, '.hermes-watchdog', 'runtime', 'current');
   const targetFile = path.join(tempHome, 'Library', 'LaunchAgents', 'ai.hermes.gateway-watchdog.plist');
 
   fs.writeFileSync(
@@ -132,11 +134,14 @@ exit 0
   assert.match(result.stdout, /Installed:/);
   assert.equal(fs.existsSync(targetFile), true);
   assert.equal(fs.existsSync(path.join(tempHome, '.hermes-watchdog', 'logs')), true);
+  assert.equal(fs.existsSync(path.join(expectedRuntimeDir, 'gateway-watchdog.sh')), true);
+  assert.equal(fs.existsSync(path.join(expectedRuntimeDir, 'watchdog-core.sh')), true);
+  assert.equal(fs.existsSync(path.join(expectedRuntimeDir, 'notifiers', 'discord.sh')), true);
   const renderedPlist = fs.readFileSync(targetFile, 'utf8');
   assert.match(renderedPlist, new RegExp(expectedEnvFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.match(renderedPlist, new RegExp(expectedLogFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.match(renderedPlist, new RegExp(expectedHermesHome.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  assert.match(renderedPlist, /gateway-watchdog\.sh/);
+  assert.match(renderedPlist, new RegExp(path.join(expectedRuntimeDir, 'gateway-watchdog.sh').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   const calls = fs.readFileSync(callsFile, 'utf8');
   assert.match(calls, /bootout gui\/\d+\/ai\.hermes\.gateway-watchdog/);
   assert.match(calls, /bootstrap gui\/\d+ .*ai\.hermes\.gateway-watchdog\.plist/);

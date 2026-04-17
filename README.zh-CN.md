@@ -48,6 +48,7 @@ watchdog 只允许重启：
 2. 在私有 env 文件里填入 webhook 和可选覆盖项。
 3. 安装 LaunchAgent：
    - `bash launchd/install-gateway-watchdog-launchagent.sh`
+   - 安装器会把可运行副本部署到 `${WATCHDOG_HOME:-$HOME/.hermes-watchdog}/runtime/current`，避免 `launchd` 依赖云盘同步目录里的 repo 路径。
 4. 确认 agent 已加载：
    - `launchctl list | rg "ai\.hermes\.gateway-watchdog"`
 5. 查看 watchdog 日志：

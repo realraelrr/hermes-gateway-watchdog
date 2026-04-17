@@ -48,6 +48,7 @@ It does not manage Clash, system proxy state, DNS, or Hermes upgrades.
 2. Fill in webhook values and any optional overrides in that private env file.
 3. Install the LaunchAgent:
    - `bash launchd/install-gateway-watchdog-launchagent.sh`
+   - The installer stages a runnable copy under `${WATCHDOG_HOME:-$HOME/.hermes-watchdog}/runtime/current` so `launchd` does not depend on cloud-synced repo paths.
 4. Verify the agent is loaded:
    - `launchctl list | rg "ai\.hermes\.gateway-watchdog"`
 5. Tail the watchdog log:
