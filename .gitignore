@@ -1,0 +1,8 @@
+.DS_Store
+.env
+*.local.env
+tmp/
+.tmp/
+.idea/
+.vscode/
+node_modules/
