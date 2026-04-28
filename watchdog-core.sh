@@ -55,18 +55,192 @@ short_hostname() {
   hostname -s 2>/dev/null || hostname
 }
 
+event_title() {
+  case "$1" in
+    restart_triggered) printf '自动重启已触发\n' ;;
+    restart_succeeded) printf '自动重启已恢复\n' ;;
+    restart_failed) printf '自动重启失败\n' ;;
+    manual_restart_triggered) printf '手动重启已触发\n' ;;
+    manual_restart_succeeded) printf '手动重启成功\n' ;;
+    manual_restart_failed) printf '手动重启失败\n' ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+event_source() {
+  case "$1" in
+    manual_restart_*) printf 'local CLI\n' ;;
+    *) printf 'passive watchdog\n' ;;
+  esac
+}
+
+reason_component() {
+  case "$1" in
+    feishu_not_connected) printf 'Hermes Gateway / Feishu 连接\n' ;;
+    gateway_listener_down) printf 'Hermes Gateway / 本地监听\n' ;;
+    gateway_state_missing|gateway_state_invalid_json|gateway_state_stale|gateway_state_timestamp_invalid|gateway_not_running) printf 'Hermes Gateway / 状态文件\n' ;;
+    webhook_route_missing|webhook_probe_unreachable) printf 'Hermes Gateway / Feishu webhook 路由\n' ;;
+    cloudflared_ready_zero|cloudflared_ready_unreachable|cloudflared_ready_invalid_json|cloudflared_ready_http_error) printf 'Cloudflare Tunnel\n' ;;
+    required_tool_missing) printf 'Watchdog 运行环境\n' ;;
+    launchctl_restart_failed) printf 'macOS launchd\n' ;;
+    manual_request) printf '本地主动控制\n' ;;
+    ok) printf '健康检查\n' ;;
+    *) printf '未知环节\n' ;;
+  esac
+}
+
+reason_summary() {
+  case "$1" in
+    feishu_not_connected) printf 'Feishu 连接未就绪\n' ;;
+    gateway_listener_down) printf '127.0.0.1:8765 未监听\n' ;;
+    gateway_state_missing) printf 'gateway_state.json 不存在\n' ;;
+    gateway_state_invalid_json) printf 'gateway_state.json 不是合法 JSON\n' ;;
+    gateway_state_stale) printf 'gateway_state.json 更新时间过旧\n' ;;
+    gateway_state_timestamp_invalid) printf 'gateway_state.json updated_at 缺失或无效\n' ;;
+    gateway_not_running) printf 'Hermes gateway 未处于 running 状态\n' ;;
+    webhook_route_missing) printf '本地 Feishu webhook 路由缺失\n' ;;
+    webhook_probe_unreachable) printf '本地 Feishu webhook 探测不可达\n' ;;
+    cloudflared_ready_zero) printf 'Cloudflare Tunnel readyConnections 为 0\n' ;;
+    cloudflared_ready_unreachable) printf 'Cloudflare Tunnel readiness 端点不可达\n' ;;
+    cloudflared_ready_invalid_json) printf 'Cloudflare Tunnel readiness 响应不是预期 JSON\n' ;;
+    cloudflared_ready_http_error) printf 'Cloudflare Tunnel readiness 返回异常 HTTP 状态\n' ;;
+    required_tool_missing) printf 'watchdog 依赖命令缺失\n' ;;
+    launchctl_restart_failed) printf 'launchctl kickstart 执行失败\n' ;;
+    manual_request) printf '本地手动请求\n' ;;
+    ok) printf '健康检查通过\n' ;;
+    *) printf '未分类原因\n' ;;
+  esac
+}
+
+action_summary() {
+  case "$1" in
+    restart_gateway) printf '重启 Hermes gateway\n' ;;
+    restart_cloudflared) printf '重启 cloudflared\n' ;;
+    restart_cloudflared_then_gateway|restart_all) printf '先重启 cloudflared，再重启 Hermes gateway\n' ;;
+    none|"") printf '不执行重启\n' ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+action_launchagents() {
+  case "$1" in
+    restart_gateway) printf '%s\n' "${GATEWAY_LABEL:-com.hermes.gateway}" ;;
+    restart_cloudflared) printf '%s\n' "${CLOUDFLARED_LABEL:-com.cloudflare.cloudflared}" ;;
+    restart_cloudflared_then_gateway|restart_all) printf '%s, %s\n' "${CLOUDFLARED_LABEL:-com.cloudflare.cloudflared}" "${GATEWAY_LABEL:-com.hermes.gateway}" ;;
+    none|"") printf 'none\n' ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
 format_notification() {
   local event="$1"
   local failure_count="$2"
   local reason="${3:-${LAST_REASON:-unknown}}"
   local action="${4:-${LAST_REPAIR_ACTION:-none}}"
+  local host title source component summary action_text labels
 
-  printf '[WATCHDOG] event=%s host=%s failures=%s reason=%s action=%s\n' \
+  host="$(short_hostname)"
+  title="$(event_title "$event")"
+  source="$(event_source "$event")"
+  component="$(reason_component "$reason")"
+  summary="$(reason_summary "$reason")"
+  action_text="$(action_summary "$action")"
+  labels="$(action_launchagents "$action")"
+
+  printf '[%s] %s\n\n主机: %s\n来源: %s\n故障环节: %s\n检测结果: gateway=%s, cloudflared=%s\n原因: %s - %s\n动作: %s\nLaunchAgent: %s\n连续失败: %s\nraw: event=%s host=%s failures=%s reason=%s action=%s\n' \
+    "${WATCHDOG_DISPLAY_NAME:-Hermes Gateway Watchdog}" \
+    "$title" \
+    "$host" \
+    "$source" \
+    "$component" \
+    "${PROBE_GATEWAY_HEALTH:-unknown}" \
+    "${PROBE_CLOUDFLARED_HEALTH:-unknown}" \
+    "$reason" \
+    "$summary" \
+    "$action_text" \
+    "$labels" \
+    "$failure_count" \
     "$event" \
-    "$(short_hostname)" \
+    "$host" \
     "$failure_count" \
     "$reason" \
     "$action"
+}
+
+usage() {
+  printf 'Usage: %s [restart gateway|cloudflared|all]\n' "${0##*/}" >&2
+}
+
+is_manual_restart_command() {
+  [[ "${1:-}" == "restart" || "${1:-}" == "--restart" ]]
+}
+
+manual_restart_action_for_target() {
+  case "${1:-}" in
+    gateway) printf 'restart_gateway\n' ;;
+    cloudflared) printf 'restart_cloudflared\n' ;;
+    all) printf 'restart_all\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+run_manual_restart_action() {
+  case "$1" in
+    restart_gateway)
+      launchctl_restart_label "$GATEWAY_LABEL" || return 1
+      ;;
+    restart_cloudflared)
+      launchctl_restart_label "$CLOUDFLARED_LABEL" || return 1
+      ;;
+    restart_all)
+      launchctl_restart_label "$CLOUDFLARED_LABEL" || return 1
+      launchctl_restart_label "$GATEWAY_LABEL" || return 1
+      ;;
+    *)
+      RESTART_FAILURE_REASON="manual_restart_invalid_action"
+      return 1
+      ;;
+  esac
+}
+
+watchdog_manual_restart() {
+  local target="${1:-}" action="" rc=0
+
+  if ! action="$(manual_restart_action_for_target "$target")"; then
+    usage
+    return 64
+  fi
+
+  load_watchdog_config
+  mkdir -p "$(dirname "$LOG_FILE")"
+  touch "$LOG_FILE"
+  load_notifier
+  notifier_init || true
+  if ! acquire_watchdog_lock; then
+    return 0
+  fi
+  trap 'watchdog_cleanup' EXIT
+  init_runtime_paths
+
+  if ! resolve_required_bins; then
+    log ERROR required_tool_missing "reason=${REQUIRED_TOOL_REASON:-required_tool_missing} command=manual_restart target=$target"
+    notify_send "$(format_notification manual_restart_failed 0 "${REQUIRED_TOOL_REASON:-required_tool_missing}" "$action")" || true
+    return 1
+  fi
+
+  log INFO manual_restart_triggered "target=$target action=$action"
+  notify_send "$(format_notification manual_restart_triggered 0 "manual_request" "$action")" || true
+  run_manual_restart_action "$action" || rc=$?
+
+  if (( rc == 0 )); then
+    log INFO manual_restart_succeeded "target=$target action=$action"
+    notify_send "$(format_notification manual_restart_succeeded 0 "manual_request" "$action")" || true
+  else
+    log ERROR manual_restart_failed "target=$target action=$action reason=${RESTART_FAILURE_REASON:-manual_restart_failed}"
+    notify_send "$(format_notification manual_restart_failed 0 "${RESTART_FAILURE_REASON:-manual_restart_failed}" "$action")" || true
+  fi
+
+  return "$rc"
 }
 
 log_resolved_tools() {
@@ -140,6 +314,11 @@ watchdog_cleanup() {
 
 watchdog_main() {
   local now_iso now_epoch probe_status repair_rc=0 incident_reason incident_action repair_reason
+
+  if is_manual_restart_command "${1:-}"; then
+    watchdog_manual_restart "${2:-}"
+    return $?
+  fi
 
   load_watchdog_config
   mkdir -p "$(dirname "$LOG_FILE")"

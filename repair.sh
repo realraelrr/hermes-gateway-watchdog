@@ -25,20 +25,20 @@ determine_repair_action() {
       ;;
   esac
 
-  if [[ "${PROBE_CLOUDFLARED_HEALTH:-unknown}" == "bad" ]] && [[ "${PROBE_GATEWAY_HEALTH:-unknown}" == "ok" ]]; then
-    printf 'restart_cloudflared\n'
-    return 0
-  fi
-
-  if [[ "${PROBE_GATEWAY_HEALTH:-unknown}" == "bad" ]] && [[ "${PROBE_CLOUDFLARED_HEALTH:-unknown}" == "ok" ]]; then
-    printf 'restart_gateway\n'
-    return 0
-  fi
-
-  if [[ "${PROBE_GATEWAY_HEALTH:-unknown}" == "bad" ]] && [[ "${PROBE_CLOUDFLARED_HEALTH:-unknown}" == "bad" ]]; then
-    printf 'restart_cloudflared_then_gateway\n'
-    return 0
-  fi
+  case "${PROBE_GATEWAY_HEALTH:-unknown}:${PROBE_CLOUDFLARED_HEALTH:-unknown}" in
+    ok:bad)
+      printf 'restart_cloudflared\n'
+      return 0
+      ;;
+    bad:ok)
+      printf 'restart_gateway\n'
+      return 0
+      ;;
+    bad:bad)
+      printf 'restart_cloudflared_then_gateway\n'
+      return 0
+      ;;
+  esac
 
   case "${PROBE_REASON:-}" in
     cloudflared_ready_zero|cloudflared_ready_unreachable|cloudflared_ready_invalid_json|cloudflared_ready_http_error)

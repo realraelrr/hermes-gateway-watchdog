@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -27,6 +27,13 @@ function writeJson(filePath, value) {
 
 function runBash(script, { env = {} } = {}) {
   return execFileSync('/bin/bash', ['-lc', script], {
+    encoding: 'utf8',
+    env: { ...process.env, ...env },
+  });
+}
+
+function runBashResult(script, { env = {} } = {}) {
+  return spawnSync('/bin/bash', ['-lc', script], {
     encoding: 'utf8',
     env: { ...process.env, ...env },
   });
@@ -139,6 +146,42 @@ test('disable semantics: watchdog_main exits before probe or repair', () => {
   `);
 
   assert.equal(output.trim(), 'done');
+});
+
+test('notify format: automatic restart message includes service, failing component, health, and label', () => {
+  const output = runBash(`
+    source "${corePath}"
+    WATCHDOG_DISPLAY_NAME="Hermes Gateway Watchdog"
+    GATEWAY_LABEL="com.hermes.gateway"
+    CLOUDFLARED_LABEL="com.cloudflare.cloudflared"
+    PROBE_GATEWAY_HEALTH="bad"
+    PROBE_CLOUDFLARED_HEALTH="ok"
+    format_notification restart_triggered 3 feishu_not_connected restart_gateway
+  `);
+
+  assert.match(output, /\[Hermes Gateway Watchdog\] 自动重启已触发/);
+  assert.match(output, /故障环节: Hermes Gateway \/ Feishu 连接/);
+  assert.match(output, /检测结果: gateway=bad, cloudflared=ok/);
+  assert.match(output, /原因: feishu_not_connected - Feishu 连接未就绪/);
+  assert.match(output, /动作: 重启 Hermes gateway/);
+  assert.match(output, /LaunchAgent: com\.hermes\.gateway/);
+  assert.match(output, /连续失败: 3/);
+});
+
+test('notify format: manual restart message identifies local CLI source', () => {
+  const output = runBash(`
+    source "${corePath}"
+    WATCHDOG_DISPLAY_NAME="Hermes Gateway Watchdog"
+    GATEWAY_LABEL="com.hermes.gateway"
+    CLOUDFLARED_LABEL="com.cloudflare.cloudflared"
+    format_notification manual_restart_succeeded 0 manual_request restart_all
+  `);
+
+  assert.match(output, /\[Hermes Gateway Watchdog\] 手动重启成功/);
+  assert.match(output, /来源: local CLI/);
+  assert.match(output, /动作: 先重启 cloudflared，再重启 Hermes gateway/);
+  assert.match(output, /LaunchAgent: com\.cloudflare\.cloudflared, com\.hermes\.gateway/);
+  assert.match(output, /原因: manual_request - 本地手动请求/);
 });
 
 test('probe: returns ok for healthy Hermes contract', () => {
@@ -521,6 +564,18 @@ test('repair: staged repair restarts cloudflared before escalating to gateway', 
   assert.match(output, /status=0 action=restart_cloudflared_then_gateway/);
   assert.match(output, /com\.cloudflare\.cloudflared/);
   assert.match(output, /com\.hermes\.gateway/);
+});
+
+test('repair: combined bad health restarts cloudflared before gateway even for gateway-side primary reason', () => {
+  const output = runBash(`
+    source "${corePath}"
+    PROBE_REASON="gateway_listener_down"
+    PROBE_GATEWAY_HEALTH="bad"
+    PROBE_CLOUDFLARED_HEALTH="bad"
+    printf '%s\\n' "$(determine_repair_action)"
+  `);
+
+  assert.equal(output.trim(), 'restart_cloudflared_then_gateway');
 });
 
 test('repair: neutral probes during grace do not fail recovery early', () => {
@@ -995,4 +1050,206 @@ JSON
   assert.equal(state.last_restart_at, '');
   assert.equal(state.cooldown_until_epoch, 0);
   assert.equal(state.transition_grace_until_epoch, 0);
+});
+
+test('manual restart: gateway target restarts only the Hermes gateway label', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-watchdog-manual-gateway-'));
+  const callsFile = path.join(tempDir, 'calls.log');
+  const noticesFile = path.join(tempDir, 'notices.log');
+
+  const output = runBash(`
+    source "${corePath}"
+    load_watchdog_config() {
+      WATCHDOG_ENABLED=1
+      FAIL_THRESHOLD=3
+      COOLDOWN_SEC=300
+      POST_RESTART_RETRIES=1
+      POST_RESTART_SLEEP_SEC=0
+      INITIAL_GRACE_SEC=0
+      TRANSITION_GRACE_SEC=45
+      WATCHDOG_DISABLE_FILE="${path.join(tempDir, 'disabled')}"
+      WATCHDOG_LOCK_DIR="${path.join(tempDir, 'gateway.lock')}"
+      WATCHDOG_RUNTIME_TMP_DIR="${path.join(tempDir, 'tmp')}"
+      STATE_FILE="${path.join(tempDir, 'state.json')}"
+      LOG_FILE="${path.join(tempDir, 'watchdog.log')}"
+      GATEWAY_LABEL="com.hermes.gateway"
+      CLOUDFLARED_LABEL="com.cloudflare.cloudflared"
+      NOTIFIER=composite
+    }
+    load_notifier() { :; }
+    notifier_init() { :; }
+    notifier_cleanup() { :; }
+    notify_send() { printf '%s\\n' "$1" >> "${noticesFile}"; }
+    log() { :; }
+    resolve_required_bins() {
+      CURL_BIN="/usr/bin/curl"
+      JQ_BIN="$(command -v jq)"
+      LAUNCHCTL_BIN="/bin/echo"
+      LSOF_BIN="/usr/sbin/lsof"
+      return 0
+    }
+    get_launchd_pid() { printf '111\\n'; }
+    probe_gateway() {
+      PROBE_STATUS="ok"
+      PROBE_REASON="ok"
+      PROBE_GATEWAY_HEALTH="ok"
+      PROBE_CLOUDFLARED_HEALTH="ok"
+      printf 'ok\\n'
+    }
+    launchctl_restart_label() {
+      printf '%s\\n' "$1" >> "${callsFile}"
+      return 0
+    }
+    watchdog_main restart gateway
+    if [[ -f "${callsFile}" ]]; then cat "${callsFile}"; fi
+    printf '%s\\n' "--- notices ---"
+    if [[ -f "${noticesFile}" ]]; then cat "${noticesFile}"; fi
+  `);
+
+  assert.match(output, /com\.hermes\.gateway/);
+  assert.doesNotMatch(output, /com\.cloudflare\.cloudflared/);
+  assert.match(output, /event=manual_restart_triggered/);
+  assert.match(output, /event=manual_restart_succeeded/);
+  assert.match(output, /action=restart_gateway/);
+});
+
+test('manual restart: cloudflared target restarts only the Cloudflare label', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-watchdog-manual-cloudflared-'));
+  const callsFile = path.join(tempDir, 'calls.log');
+
+  const output = runBash(`
+    source "${corePath}"
+    load_watchdog_config() {
+      WATCHDOG_ENABLED=1
+      FAIL_THRESHOLD=3
+      COOLDOWN_SEC=300
+      POST_RESTART_RETRIES=1
+      POST_RESTART_SLEEP_SEC=0
+      INITIAL_GRACE_SEC=0
+      TRANSITION_GRACE_SEC=45
+      WATCHDOG_DISABLE_FILE="${path.join(tempDir, 'disabled')}"
+      WATCHDOG_LOCK_DIR="${path.join(tempDir, 'gateway.lock')}"
+      WATCHDOG_RUNTIME_TMP_DIR="${path.join(tempDir, 'tmp')}"
+      STATE_FILE="${path.join(tempDir, 'state.json')}"
+      LOG_FILE="${path.join(tempDir, 'watchdog.log')}"
+      GATEWAY_LABEL="com.hermes.gateway"
+      CLOUDFLARED_LABEL="com.cloudflare.cloudflared"
+      NOTIFIER=composite
+    }
+    load_notifier() { :; }
+    notifier_init() { :; }
+    notifier_cleanup() { :; }
+    notify_send() { :; }
+    log() { :; }
+    resolve_required_bins() {
+      CURL_BIN="/usr/bin/curl"
+      JQ_BIN="$(command -v jq)"
+      LAUNCHCTL_BIN="/bin/echo"
+      LSOF_BIN="/usr/sbin/lsof"
+      return 0
+    }
+    launchctl_restart_label() {
+      printf '%s\\n' "$1" >> "${callsFile}"
+      return 0
+    }
+    watchdog_main restart cloudflared
+    if [[ -f "${callsFile}" ]]; then cat "${callsFile}"; fi
+  `);
+
+  assert.equal(output.trim(), 'com.cloudflare.cloudflared');
+});
+
+test('manual restart: all target restarts cloudflared before the Hermes gateway', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-watchdog-manual-all-'));
+  const callsFile = path.join(tempDir, 'calls.log');
+
+  const output = runBash(`
+    source "${corePath}"
+    load_watchdog_config() {
+      WATCHDOG_ENABLED=1
+      FAIL_THRESHOLD=3
+      COOLDOWN_SEC=300
+      POST_RESTART_RETRIES=1
+      POST_RESTART_SLEEP_SEC=0
+      INITIAL_GRACE_SEC=0
+      TRANSITION_GRACE_SEC=45
+      WATCHDOG_DISABLE_FILE="${path.join(tempDir, 'disabled')}"
+      WATCHDOG_LOCK_DIR="${path.join(tempDir, 'gateway.lock')}"
+      WATCHDOG_RUNTIME_TMP_DIR="${path.join(tempDir, 'tmp')}"
+      STATE_FILE="${path.join(tempDir, 'state.json')}"
+      LOG_FILE="${path.join(tempDir, 'watchdog.log')}"
+      GATEWAY_LABEL="com.hermes.gateway"
+      CLOUDFLARED_LABEL="com.cloudflare.cloudflared"
+      NOTIFIER=composite
+    }
+    load_notifier() { :; }
+    notifier_init() { :; }
+    notifier_cleanup() { :; }
+    notify_send() { :; }
+    log() { :; }
+    resolve_required_bins() {
+      CURL_BIN="/usr/bin/curl"
+      JQ_BIN="$(command -v jq)"
+      LAUNCHCTL_BIN="/bin/echo"
+      LSOF_BIN="/usr/sbin/lsof"
+      return 0
+    }
+    launchctl_restart_label() {
+      printf '%s\\n' "$1" >> "${callsFile}"
+      return 0
+    }
+    watchdog_main restart all
+    if [[ -f "${callsFile}" ]]; then cat "${callsFile}"; fi
+  `);
+
+  assert.equal(output.trim(), 'com.cloudflare.cloudflared\ncom.hermes.gateway');
+});
+
+test('manual restart: invalid target exits non-zero without restarting labels', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-watchdog-manual-invalid-'));
+  const callsFile = path.join(tempDir, 'calls.log');
+
+  const result = runBashResult(`
+    source "${corePath}"
+    load_watchdog_config() {
+      WATCHDOG_ENABLED=1
+      FAIL_THRESHOLD=3
+      COOLDOWN_SEC=300
+      POST_RESTART_RETRIES=1
+      POST_RESTART_SLEEP_SEC=0
+      INITIAL_GRACE_SEC=0
+      TRANSITION_GRACE_SEC=45
+      WATCHDOG_DISABLE_FILE="${path.join(tempDir, 'disabled')}"
+      WATCHDOG_LOCK_DIR="${path.join(tempDir, 'gateway.lock')}"
+      WATCHDOG_RUNTIME_TMP_DIR="${path.join(tempDir, 'tmp')}"
+      STATE_FILE="${path.join(tempDir, 'state.json')}"
+      LOG_FILE="${path.join(tempDir, 'watchdog.log')}"
+      GATEWAY_LABEL="com.hermes.gateway"
+      CLOUDFLARED_LABEL="com.cloudflare.cloudflared"
+      NOTIFIER=composite
+    }
+    load_notifier() { :; }
+    notifier_init() { :; }
+    notifier_cleanup() { :; }
+    notify_send() { :; }
+    log() { :; }
+    resolve_required_bins() { return 0; }
+    get_launchd_pid() { printf '111\\n'; }
+    probe_gateway() {
+      PROBE_STATUS="ok"
+      PROBE_REASON="ok"
+      PROBE_GATEWAY_HEALTH="ok"
+      PROBE_CLOUDFLARED_HEALTH="ok"
+      printf 'ok\\n'
+    }
+    launchctl_restart_label() {
+      printf '%s\\n' "$1" >> "${callsFile}"
+      return 0
+    }
+    watchdog_main restart database
+  `);
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Usage:/);
+  assert.equal(fs.existsSync(callsFile), false);
 });

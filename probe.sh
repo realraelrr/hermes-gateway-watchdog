@@ -40,154 +40,231 @@ probe_emit() {
   printf '%s\n' "$1"
 }
 
-probe_gateway() {
-  local state_file gateway_state="" feishu_state="" updated_at="" updated_epoch="" now_epoch
-  local listener_ok=0 ready_output="" ready_http="" ready_body="" ready_connections=""
-  local webhook_output="" webhook_http=""
-  local max_age ready_url webhook_url
-  local gateway_failure_reason="" gateway_partial_reason=""
-  local cloudflared_failure_reason="" cloudflared_partial_reason=""
-
+reset_probe_result() {
   PROBE_REASON="ok"
   PROBE_STATUS="ok"
   PROBE_GATEWAY_HEALTH="unknown"
   PROBE_CLOUDFLARED_HEALTH="unknown"
-  max_age="${GATEWAY_STATE_MAX_AGE_SEC:-90}"
-  ready_url="${CLOUDFLARED_READY_URL:-http://127.0.0.1:20241/ready}"
-  webhook_url="${FEISHU_WEBHOOK_PROBE_URL:-http://127.0.0.1:8765/feishu/webhook}"
-  state_file="$(gateway_state_file_path)"
+
+  PROBE_GATEWAY_STATE=""
+  PROBE_FEISHU_STATE=""
+  PROBE_GATEWAY_LISTENER_OK=0
+  PROBE_GATEWAY_FAILURE_REASON=""
+  PROBE_GATEWAY_PARTIAL_REASON=""
+  PROBE_CLOUDFLARED_FAILURE_REASON=""
+  PROBE_CLOUDFLARED_PARTIAL_REASON=""
+}
+
+probe_in_grace() {
+  [[ "${PROBE_WITHIN_GRACE:-0}" == "1" ]]
+}
+
+gateway_transition_grace_applies() {
+  probe_in_grace && [[ "${PROBE_GATEWAY_STATE:-}" == "starting" || -n "${CURRENT_GATEWAY_PID:-}" ]]
+}
+
+set_gateway_failure_if_empty() {
+  PROBE_GATEWAY_FAILURE_REASON="${PROBE_GATEWAY_FAILURE_REASON:-$1}"
+}
+
+set_gateway_partial_if_empty() {
+  PROBE_GATEWAY_PARTIAL_REASON="${PROBE_GATEWAY_PARTIAL_REASON:-$1}"
+}
+
+set_gateway_failure_or_partial() {
+  local reason="$1"
+  local grace_mode="${2:-transition}"
+
+  case "$grace_mode" in
+    pid)
+      if probe_in_grace && [[ -n "${CURRENT_GATEWAY_PID:-}" ]]; then
+        set_gateway_partial_if_empty "$reason"
+      else
+        set_gateway_failure_if_empty "$reason"
+      fi
+      ;;
+    any)
+      if probe_in_grace; then
+        set_gateway_partial_if_empty "$reason"
+      else
+        set_gateway_failure_if_empty "$reason"
+      fi
+      ;;
+    *)
+      if gateway_transition_grace_applies; then
+        set_gateway_partial_if_empty "$reason"
+      else
+        set_gateway_failure_if_empty "$reason"
+      fi
+      ;;
+  esac
+}
+
+check_gateway_timestamp() {
+  local updated_at="$1"
+  local updated_epoch="" now_epoch
+  local max_age="${GATEWAY_STATE_MAX_AGE_SEC:-90}"
+
+  if [[ -z "$updated_at" ]]; then
+    set_gateway_failure_or_partial gateway_state_timestamp_invalid transition
+    return 0
+  fi
+
+  updated_epoch="$(parse_timestamp_epoch "$updated_at")"
+  if [[ -z "$updated_epoch" ]]; then
+    set_gateway_failure_or_partial gateway_state_timestamp_invalid transition
+    return 0
+  fi
+
+  now_epoch="$(date +%s)"
+  if (( now_epoch - updated_epoch > max_age )); then
+    set_gateway_failure_if_empty gateway_state_stale
+  fi
+}
+
+check_gateway_state_file() {
+  local state_file="$1" updated_at=""
 
   if [[ ! -f "$state_file" ]]; then
-    if [[ "${PROBE_WITHIN_GRACE:-0}" == "1" ]] && [[ -n "${CURRENT_GATEWAY_PID:-}" ]]; then
-      gateway_partial_reason="gateway_state_missing"
-    else
-      gateway_failure_reason="gateway_state_missing"
-    fi
-  elif ! "${JQ_BIN:-$(command -v jq)}" -e . >/dev/null 2>&1 < "$state_file"; then
-    gateway_failure_reason="gateway_state_invalid_json"
-  else
-    gateway_state="$("${JQ_BIN:-$(command -v jq)}" -r '.gateway_state // empty' "$state_file")"
-    feishu_state="$("${JQ_BIN:-$(command -v jq)}" -r '.platforms.feishu.state // empty' "$state_file")"
-    updated_at="$("${JQ_BIN:-$(command -v jq)}" -r '.updated_at // empty' "$state_file")"
+    set_gateway_failure_or_partial gateway_state_missing pid
+    return 0
+  fi
 
-    if [[ -z "$updated_at" ]]; then
-      if [[ "${PROBE_WITHIN_GRACE:-0}" == "1" ]] && [[ "$gateway_state" == "starting" || -n "${CURRENT_GATEWAY_PID:-}" ]]; then
-        gateway_partial_reason="gateway_state_timestamp_invalid"
-      else
-        gateway_failure_reason="gateway_state_timestamp_invalid"
-      fi
-    else
-      updated_epoch="$(parse_timestamp_epoch "$updated_at")"
-      if [[ -z "$updated_epoch" ]]; then
-        if [[ "${PROBE_WITHIN_GRACE:-0}" == "1" ]] && [[ "$gateway_state" == "starting" || -n "${CURRENT_GATEWAY_PID:-}" ]]; then
-          gateway_partial_reason="gateway_state_timestamp_invalid"
-        else
-          gateway_failure_reason="gateway_state_timestamp_invalid"
-        fi
-      else
-        now_epoch="$(date +%s)"
-        if (( now_epoch - updated_epoch > max_age )); then
-          gateway_failure_reason="gateway_state_stale"
-        fi
-      fi
-    fi
+  if ! "${JQ_BIN:-$(command -v jq)}" -e . >/dev/null 2>&1 < "$state_file"; then
+    set_gateway_failure_if_empty gateway_state_invalid_json
+    return 0
+  fi
 
-    if [[ -z "$gateway_failure_reason" ]]; then
-      if [[ "$gateway_state" == "starting" ]] && [[ "${PROBE_WITHIN_GRACE:-0}" == "1" ]]; then
-        gateway_partial_reason="${gateway_partial_reason:-gateway_not_running}"
-      elif [[ "$gateway_state" != "running" ]]; then
-        gateway_failure_reason="gateway_not_running"
-      fi
-    fi
+  PROBE_GATEWAY_STATE="$("${JQ_BIN:-$(command -v jq)}" -r '.gateway_state // empty' "$state_file")"
+  PROBE_FEISHU_STATE="$("${JQ_BIN:-$(command -v jq)}" -r '.platforms.feishu.state // empty' "$state_file")"
+  updated_at="$("${JQ_BIN:-$(command -v jq)}" -r '.updated_at // empty' "$state_file")"
 
-    if [[ -z "$gateway_failure_reason" && "$feishu_state" != "connected" ]]; then
-      if [[ "${PROBE_WITHIN_GRACE:-0}" == "1" ]]; then
-        gateway_partial_reason="${gateway_partial_reason:-feishu_not_connected}"
-      else
-        gateway_failure_reason="feishu_not_connected"
-      fi
+  check_gateway_timestamp "$updated_at"
+
+  if [[ -z "$PROBE_GATEWAY_FAILURE_REASON" ]]; then
+    if [[ "$PROBE_GATEWAY_STATE" == "starting" ]] && probe_in_grace; then
+      set_gateway_partial_if_empty gateway_not_running
+    elif [[ "$PROBE_GATEWAY_STATE" != "running" ]]; then
+      set_gateway_failure_if_empty gateway_not_running
     fi
   fi
 
+  if [[ -z "$PROBE_GATEWAY_FAILURE_REASON" && "$PROBE_FEISHU_STATE" != "connected" ]]; then
+    set_gateway_failure_or_partial feishu_not_connected any
+  fi
+}
+
+check_gateway_listener_health() {
   if check_gateway_listener; then
-    listener_ok=1
-  else
-    if [[ "${PROBE_WITHIN_GRACE:-0}" == "1" ]] && [[ "$gateway_state" == "starting" || -n "${CURRENT_GATEWAY_PID:-}" ]]; then
-      gateway_partial_reason="${gateway_partial_reason:-gateway_not_running}"
-    else
-      gateway_failure_reason="${gateway_failure_reason:-gateway_listener_down}"
-    fi
+    PROBE_GATEWAY_LISTENER_OK=1
+    return 0
   fi
+
+  if gateway_transition_grace_applies; then
+    set_gateway_partial_if_empty gateway_not_running
+  else
+    set_gateway_failure_if_empty gateway_listener_down
+  fi
+}
+
+check_cloudflared_ready_health() {
+  local ready_url="${CLOUDFLARED_READY_URL:-http://127.0.0.1:20241/ready}"
+  local ready_output="" ready_http="" ready_body="" ready_connections=""
 
   if ! ready_output="$(http_probe "$ready_url")"; then
-    cloudflared_failure_reason="cloudflared_ready_unreachable"
-  else
-    ready_http="${ready_output%%$'\t'*}"
-    ready_body="${ready_output#*$'\t'}"
-
-    if [[ "$ready_http" != "200" && "$ready_http" != "503" ]]; then
-      cloudflared_failure_reason="cloudflared_ready_http_error"
-    else
-      ready_connections="$("${JQ_BIN:-$(command -v jq)}" -r 'if (.readyConnections | type) == "number" then .readyConnections else empty end' <<<"$ready_body" 2>/dev/null || true)"
-      if [[ -z "$ready_connections" ]]; then
-        cloudflared_failure_reason="cloudflared_ready_invalid_json"
-      elif [[ "$ready_http" == "503" ]] || (( ready_connections == 0 )); then
-        if [[ "${PROBE_WITHIN_GRACE:-0}" == "1" ]]; then
-          cloudflared_partial_reason="cloudflared_ready_zero"
-        else
-          cloudflared_failure_reason="cloudflared_ready_zero"
-        fi
-      fi
-    fi
+    PROBE_CLOUDFLARED_FAILURE_REASON="cloudflared_ready_unreachable"
+    return 0
   fi
 
-  if (( listener_ok == 1 )); then
-    if ! webhook_output="$(http_probe "$webhook_url")"; then
-      gateway_failure_reason="${gateway_failure_reason:-webhook_probe_unreachable}"
-    else
-      webhook_http="${webhook_output%%$'\t'*}"
-      case "$webhook_http" in
-        405) ;;
-        404) gateway_failure_reason="${gateway_failure_reason:-webhook_route_missing}" ;;
-        *) gateway_failure_reason="${gateway_failure_reason:-webhook_probe_unreachable}" ;;
-      esac
-    fi
+  ready_http="${ready_output%%$'\t'*}"
+  ready_body="${ready_output#*$'\t'}"
+
+  if [[ "$ready_http" != "200" && "$ready_http" != "503" ]]; then
+    PROBE_CLOUDFLARED_FAILURE_REASON="cloudflared_ready_http_error"
+    return 0
   fi
 
-  if [[ -n "$gateway_failure_reason" ]]; then
+  ready_connections="$("${JQ_BIN:-$(command -v jq)}" -r 'if (.readyConnections | type) == "number" then .readyConnections else empty end' <<<"$ready_body" 2>/dev/null || true)"
+  if [[ -z "$ready_connections" ]]; then
+    PROBE_CLOUDFLARED_FAILURE_REASON="cloudflared_ready_invalid_json"
+  elif [[ "$ready_http" == "503" ]] || (( ready_connections == 0 )); then
+    if probe_in_grace; then
+      PROBE_CLOUDFLARED_PARTIAL_REASON="cloudflared_ready_zero"
+    else
+      PROBE_CLOUDFLARED_FAILURE_REASON="cloudflared_ready_zero"
+    fi
+  fi
+}
+
+check_webhook_route_health() {
+  local webhook_url="${FEISHU_WEBHOOK_PROBE_URL:-http://127.0.0.1:8765/feishu/webhook}"
+  local webhook_output="" webhook_http=""
+
+  (( PROBE_GATEWAY_LISTENER_OK == 1 )) || return 0
+
+  if ! webhook_output="$(http_probe "$webhook_url")"; then
+    set_gateway_failure_if_empty webhook_probe_unreachable
+    return 0
+  fi
+
+  webhook_http="${webhook_output%%$'\t'*}"
+  case "$webhook_http" in
+    405) ;;
+    404) set_gateway_failure_if_empty webhook_route_missing ;;
+    *) set_gateway_failure_if_empty webhook_probe_unreachable ;;
+  esac
+}
+
+set_probe_health_fields() {
+  if [[ -n "$PROBE_GATEWAY_FAILURE_REASON" ]]; then
     PROBE_GATEWAY_HEALTH="bad"
-  elif [[ -n "$gateway_partial_reason" ]]; then
+  elif [[ -n "$PROBE_GATEWAY_PARTIAL_REASON" ]]; then
     PROBE_GATEWAY_HEALTH="partial"
   else
     PROBE_GATEWAY_HEALTH="ok"
   fi
 
-  if [[ -n "$cloudflared_failure_reason" ]]; then
+  if [[ -n "$PROBE_CLOUDFLARED_FAILURE_REASON" ]]; then
     PROBE_CLOUDFLARED_HEALTH="bad"
-  elif [[ -n "$cloudflared_partial_reason" ]]; then
+  elif [[ -n "$PROBE_CLOUDFLARED_PARTIAL_REASON" ]]; then
     PROBE_CLOUDFLARED_HEALTH="partial"
   else
     PROBE_CLOUDFLARED_HEALTH="ok"
   fi
+}
 
-  if [[ -n "$gateway_failure_reason" || -n "$cloudflared_failure_reason" ]]; then
-    if [[ -n "$gateway_failure_reason" ]]; then
-      probe_emit fail "$gateway_failure_reason"
+emit_probe_result_from_reasons() {
+  if [[ -n "$PROBE_GATEWAY_FAILURE_REASON" || -n "$PROBE_CLOUDFLARED_FAILURE_REASON" ]]; then
+    if [[ -n "$PROBE_GATEWAY_FAILURE_REASON" ]]; then
+      probe_emit fail "$PROBE_GATEWAY_FAILURE_REASON"
     else
-      probe_emit fail "$cloudflared_failure_reason"
+      probe_emit fail "$PROBE_CLOUDFLARED_FAILURE_REASON"
     fi
     return 0
   fi
 
-  if [[ -n "$gateway_partial_reason" || -n "$cloudflared_partial_reason" ]]; then
-    if [[ -n "$gateway_partial_reason" ]]; then
-      probe_emit neutral "$gateway_partial_reason"
+  if [[ -n "$PROBE_GATEWAY_PARTIAL_REASON" || -n "$PROBE_CLOUDFLARED_PARTIAL_REASON" ]]; then
+    if [[ -n "$PROBE_GATEWAY_PARTIAL_REASON" ]]; then
+      probe_emit neutral "$PROBE_GATEWAY_PARTIAL_REASON"
     else
-      probe_emit neutral "$cloudflared_partial_reason"
+      probe_emit neutral "$PROBE_CLOUDFLARED_PARTIAL_REASON"
     fi
     return 0
   fi
 
   probe_emit ok ok
-  return 0
+}
+
+probe_gateway() {
+  local state_file
+
+  reset_probe_result
+  state_file="$(gateway_state_file_path)"
+
+  check_gateway_state_file "$state_file"
+  check_gateway_listener_health
+  check_cloudflared_ready_health
+  check_webhook_route_health
+  set_probe_health_fields
+  emit_probe_result_from_reasons
 }

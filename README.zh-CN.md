@@ -1,131 +1,114 @@
 # Hermes Gateway Watchdog
 
-让本机的 Hermes 飞书 webhook 部署在 macOS 上可恢复，而不是“进程还在但链路已经死了”。
-
-Hermes Gateway Watchdog 是一个独立的 Bash-first `launchd` watchdog，用来监控本机 Hermes gateway、Cloudflare Tunnel 和飞书 webhook 路由的运行合同。在探测失败后，它只会重启允许的 LaunchAgent，并通过飞书或 Discord 发出告警。
+本地 `launchd` watchdog，用于让 macOS 上的 Hermes 飞书 webhook 部署可恢复。它监控 Hermes gateway、Cloudflare Tunnel readiness 和本地飞书 webhook 路由；当运行合同连续失败时，只重启允许的 LaunchAgent，并通过飞书/Discord 告警。
 
 [English README](./README.md)
 
 许可证：MIT
 
-## 它监控什么
+## 范围
 
-健康合同要求同时满足：
+健康合同要求：
 
 - `~/.hermes/gateway_state.json` 存在且是合法 JSON。
 - `gateway_state == "running"`。
 - `platforms.feishu.state == "connected"`。
 - 顶层 `updated_at` 在 `GATEWAY_STATE_MAX_AGE_SEC` 内足够新。
 - Hermes 正在监听 `127.0.0.1:8765`。
-- `http://127.0.0.1:20241/ready` 返回 HTTP `200` 且 `readyConnections >= 1`。
+- `http://127.0.0.1:20241/ready` 返回 `200`，且 `readyConnections >= 1`。
 - `GET http://127.0.0.1:8765/feishu/webhook` 返回 `405`。
 
-v1 不做真正的外部飞书回环探测。它把本地 webhook 暴露、tunnel readiness 和 Hermes 的飞书连接状态当作受支持的运行合同。
-
-## 恢复边界
-
-watchdog 只允许重启：
+恢复边界只包括：
 
 - `com.hermes.gateway`
 - `com.cloudflare.cloudflared`
 
-它不会管理 Clash、系统代理、DNS 或 Hermes 升级。
+它不管理 Clash、系统代理、DNS、Hermes 升级，也不做外部飞书端到端回环探测。当 gateway 和 cloudflared 同时不健康时，被动修复策略是分阶段执行：先重启 cloudflared；如果仍未恢复，再重启 Hermes gateway。
 
-## 前置依赖
+## 本地主动重启
 
-- macOS
-- `jq`
-- `curl`
-- `launchctl`
-- `lsof`
-- 已存在的用户级 LaunchAgent：`com.hermes.gateway` 与 `com.cloudflare.cloudflared`
-
-## 快速开始
-
-1. 创建私有 env 文件：
-   - `mkdir -p "${WATCHDOG_HOME:-$HOME/.hermes-watchdog}/config"`
-   - `cp config.example.env "${WATCHDOG_ENV_FILE:-$HOME/.hermes-watchdog/config/watchdog.env}"`
-2. 在私有 env 文件里填入 webhook 和可选覆盖项。
-3. 安装 LaunchAgent：
-   - `bash launchd/install-gateway-watchdog-launchagent.sh`
-   - 安装器会把可运行副本部署到 `${WATCHDOG_HOME:-$HOME/.hermes-watchdog}/runtime/current`，避免 `launchd` 依赖云盘同步目录里的 repo 路径。
-4. 确认 agent 已加载：
-   - `launchctl list | rg "ai\.hermes\.gateway-watchdog"`
-5. 查看 watchdog 日志：
-   - `tail -n 20 "${WATCHDOG_LOG_DIR:-$HOME/.hermes-watchdog/logs}/gateway-watchdog.log"`
-
-## 配置
-
-配置优先级固定为：`process env > watchdog env file > defaults`
-
-路径变量：
-
-- `HERMES_HOME`
-- `WATCHDOG_HOME`
-- `WATCHDOG_STATE_DIR`
-- `WATCHDOG_LOG_DIR`
-- `WATCHDOG_ENV_FILE`
-- `WATCHDOG_DISABLE_FILE`
-
-行为变量：
-
-- `WATCHDOG_ENABLED`
-- `NOTIFIER`
-- `FAIL_THRESHOLD`
-- `COOLDOWN_SEC`
-- `POST_RESTART_RETRIES`
-- `POST_RESTART_SLEEP_SEC`
-- `INITIAL_GRACE_SEC`
-- `TRANSITION_GRACE_SEC`
-- `LOCK_STALE_SEC`
-- `GATEWAY_STATE_MAX_AGE_SEC`
-- `GATEWAY_LABEL`
-- `CLOUDFLARED_LABEL`
-- `CLOUDFLARED_READY_URL`
-- `FEISHU_WEBHOOK_PROBE_URL`
-- `DISCORD_WATCHDOG_WEBHOOK_URL`
-- `FEISHU_WATCHDOG_WEBHOOK_URL`
-
-私有 env 文件通过 allowlist 的 `key=value` 解析器读取，不会被直接 `source`。
-
-## 通知
-
-支持的 notifier：
-
-- `discord`
-- `feishu`
-- `composite`
-
-通知内容会包含事件类型、主机名、失败次数、主故障原因和本次修复动作。
-
-## 验证命令
+不等待被动探测，直接本地触发重启：
 
 ```bash
-bash -n gateway-watchdog.sh
-bash -n watchdog-core.sh
-bash -n config.sh
-bash -n state.sh
-bash -n probe.sh
-bash -n repair.sh
-bash -n notifiers/discord.sh
-bash -n notifiers/feishu.sh
-bash -n notifiers/composite.sh
-bash -n launchd/install-gateway-watchdog-launchagent.sh
-bash -n launchd/uninstall-gateway-watchdog-launchagent.sh
-node --test tests/gateway-watchdog-core.test.mjs tests/gateway-watchdog-feishu.test.mjs
+bash gateway-watchdog.sh restart gateway
+bash gateway-watchdog.sh restart cloudflared
+bash gateway-watchdog.sh restart all
+```
+
+`all` 会先重启 cloudflared，再重启 Hermes gateway。这个能力只在本地生效；没有聊天命令、webhook receiver 或远程控制端点。
+
+## 安装
+
+依赖：macOS、`jq`、`curl`、`launchctl`、`lsof`，以及已存在的 Hermes/cloudflared 用户级 LaunchAgent。
+
+```bash
+mkdir -p "${WATCHDOG_HOME:-$HOME/.hermes-watchdog}/config"
+cp config.example.env "${WATCHDOG_ENV_FILE:-$HOME/.hermes-watchdog/config/watchdog.env}"
+bash launchd/install-gateway-watchdog-launchagent.sh
 launchctl list | rg "ai\.hermes\.gateway-watchdog"
 tail -n 20 "${WATCHDOG_LOG_DIR:-$HOME/.hermes-watchdog/logs}/gateway-watchdog.log"
 ```
 
-## 安全说明
+安装脚本会把可运行副本部署到 `${WATCHDOG_HOME:-$HOME/.hermes-watchdog}/runtime/current`，避免 `launchd` 依赖云盘同步目录里的 repo 路径。
 
-1. 不要提交私有 watchdog env 文件。
-2. Webhook URL 属于 secret，应放在私有 env 文件中。
-3. notifier 采用白名单加载，只允许受控的 `notifiers/` 目录。
-4. 渲染后的 LaunchAgent 只写入路径和非 secret 环境变量。
+## 配置
 
-## 已知限制
+优先级：`process env > watchdog env file > defaults`。
 
-1. `NOTIFIER=composite` 仍然是同步串行发送。
-2. watchdog 使用的是本地运行合同探测，不是完整的飞书端到端回环。
-3. 仓库刻意只支持 `macOS + launchd + Hermes webhook mode`。
+常用选项：
+
+- `WATCHDOG_DISPLAY_NAME`：告警标题；Hermes 和 OpenClaw 都有 watchdog 时尤其有用。
+- `NOTIFIER`：`discord`、`feishu` 或 `composite`。
+- `FAIL_THRESHOLD`、`COOLDOWN_SEC`、`POST_RESTART_RETRIES`、`POST_RESTART_SLEEP_SEC`。
+- `INITIAL_GRACE_SEC`、`TRANSITION_GRACE_SEC`、`LOCK_STALE_SEC`。
+- `GATEWAY_STATE_MAX_AGE_SEC`。
+- `GATEWAY_LABEL`、`CLOUDFLARED_LABEL`。
+- `CLOUDFLARED_READY_URL`、`FEISHU_WEBHOOK_PROBE_URL`。
+- `DISCORD_WATCHDOG_WEBHOOK_URL`、`FEISHU_WATCHDOG_WEBHOOK_URL`。
+
+路径覆盖项包括 `HERMES_HOME`、`WATCHDOG_HOME`、`WATCHDOG_STATE_DIR`、`WATCHDOG_LOG_DIR`、`WATCHDOG_ENV_FILE` 和 `WATCHDOG_DISABLE_FILE`。
+
+私有 env 文件通过 allowlist 解析，不会被当作 shell 脚本 source。Webhook URL 属于 secret，不要提交到 git。
+
+## 告警
+
+告警是多行、面向用户的文本，包含：
+
+- watchdog 显示名和事件状态
+- 主机和来源（`passive watchdog` 或 `local CLI`）
+- 故障环节、raw reason 和简短解释
+- gateway/cloudflared 健康状态
+- 本次动作和 LaunchAgent label
+- 最后一行 raw 字段，便于排查
+
+示例：
+
+```text
+[Hermes Gateway Watchdog] 自动重启已触发
+
+主机: my-mac
+来源: passive watchdog
+故障环节: Hermes Gateway / Feishu 连接
+检测结果: gateway=bad, cloudflared=ok
+原因: feishu_not_connected - Feishu 连接未就绪
+动作: 重启 Hermes gateway
+LaunchAgent: com.hermes.gateway
+连续失败: 3
+raw: event=restart_triggered host=my-mac failures=3 reason=feishu_not_connected action=restart_gateway
+```
+
+## 验证
+
+```bash
+bash -n gateway-watchdog.sh watchdog-core.sh config.sh state.sh probe.sh repair.sh \
+  notifiers/discord.sh notifiers/feishu.sh notifiers/composite.sh \
+  launchd/install-gateway-watchdog-launchagent.sh \
+  launchd/uninstall-gateway-watchdog-launchagent.sh
+node --test tests/gateway-watchdog-core.test.mjs tests/gateway-watchdog-feishu.test.mjs
+```
+
+## 限制
+
+- `NOTIFIER=composite` 是同步串行发送。
+- 探测是本地运行合同检查，不是完整的飞书端到端测试。
+- 仓库刻意只支持 `macOS + launchd + Hermes webhook mode`。
