@@ -42,14 +42,14 @@ bash gateway-watchdog.sh restart all
 Requirements: macOS, `jq`, `curl`, `launchctl`, `lsof`, and existing user LaunchAgents for Hermes and cloudflared.
 
 ```bash
-mkdir -p "${WATCHDOG_HOME:-$HOME/.hermes-watchdog}/config"
-cp config.example.env "${WATCHDOG_ENV_FILE:-$HOME/.hermes-watchdog/config/watchdog.env}"
+mkdir -p "${WATCHDOG_HOME:-$HOME/.hermes/watchdog}/config"
+cp config.example.env "${WATCHDOG_ENV_FILE:-$HOME/.hermes/watchdog/config/watchdog.env}"
 bash launchd/install-gateway-watchdog-launchagent.sh
 launchctl list | rg "ai\.hermes\.gateway-watchdog"
-tail -n 20 "${WATCHDOG_LOG_DIR:-$HOME/.hermes-watchdog/logs}/gateway-watchdog.log"
+tail -n 20 "${WATCHDOG_LOG_DIR:-$HOME/.hermes/watchdog/logs}/gateway-watchdog.log"
 ```
 
-The installer stages a runnable copy under `${WATCHDOG_HOME:-$HOME/.hermes-watchdog}/runtime/current` so `launchd` does not depend on a cloud-synced repo path.
+The installer stages a runnable copy under `${WATCHDOG_HOME:-$HOME/.hermes/watchdog}/runtime/current` so `launchd` does not depend on a cloud-synced repo path.
 
 ## Configuration
 
@@ -64,11 +64,12 @@ Common options:
 - `GATEWAY_STATE_MAX_AGE_SEC`.
 - `GATEWAY_LABEL`, `CLOUDFLARED_LABEL`.
 - `CLOUDFLARED_READY_URL`, `FEISHU_WEBHOOK_PROBE_URL`.
-- `DISCORD_WATCHDOG_WEBHOOK_URL`, `FEISHU_WATCHDOG_WEBHOOK_URL`.
+- `DISCORD_WATCHDOG_WEBHOOK_URL`.
+- `FEISHU_BOT_APP_ID`, `FEISHU_BOT_APP_SECRET`, `FEISHU_BOT_CHAT_ID`.
 
 Path overrides include `HERMES_HOME`, `WATCHDOG_HOME`, `WATCHDOG_STATE_DIR`, `WATCHDOG_LOG_DIR`, `WATCHDOG_ENV_FILE`, and `WATCHDOG_DISABLE_FILE`.
 
-The private env file is parsed through an allowlist and is not sourced as shell code. Webhook URLs are secrets and should live in the private env file.
+The private env file is parsed through an allowlist and is not sourced as shell code. Feishu bot credentials are secrets and should live in the private env file.
 
 ## Alerts
 

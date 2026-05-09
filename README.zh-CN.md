@@ -42,14 +42,14 @@ bash gateway-watchdog.sh restart all
 依赖：macOS、`jq`、`curl`、`launchctl`、`lsof`，以及已存在的 Hermes/cloudflared 用户级 LaunchAgent。
 
 ```bash
-mkdir -p "${WATCHDOG_HOME:-$HOME/.hermes-watchdog}/config"
-cp config.example.env "${WATCHDOG_ENV_FILE:-$HOME/.hermes-watchdog/config/watchdog.env}"
+mkdir -p "${WATCHDOG_HOME:-$HOME/.hermes/watchdog}/config"
+cp config.example.env "${WATCHDOG_ENV_FILE:-$HOME/.hermes/watchdog/config/watchdog.env}"
 bash launchd/install-gateway-watchdog-launchagent.sh
 launchctl list | rg "ai\.hermes\.gateway-watchdog"
-tail -n 20 "${WATCHDOG_LOG_DIR:-$HOME/.hermes-watchdog/logs}/gateway-watchdog.log"
+tail -n 20 "${WATCHDOG_LOG_DIR:-$HOME/.hermes/watchdog/logs}/gateway-watchdog.log"
 ```
 
-安装脚本会把可运行副本部署到 `${WATCHDOG_HOME:-$HOME/.hermes-watchdog}/runtime/current`，避免 `launchd` 依赖云盘同步目录里的 repo 路径。
+安装脚本会把可运行副本部署到 `${WATCHDOG_HOME:-$HOME/.hermes/watchdog}/runtime/current`，避免 `launchd` 依赖云盘同步目录里的 repo 路径。
 
 ## 配置
 
@@ -64,11 +64,12 @@ tail -n 20 "${WATCHDOG_LOG_DIR:-$HOME/.hermes-watchdog/logs}/gateway-watchdog.lo
 - `GATEWAY_STATE_MAX_AGE_SEC`。
 - `GATEWAY_LABEL`、`CLOUDFLARED_LABEL`。
 - `CLOUDFLARED_READY_URL`、`FEISHU_WEBHOOK_PROBE_URL`。
-- `DISCORD_WATCHDOG_WEBHOOK_URL`、`FEISHU_WATCHDOG_WEBHOOK_URL`。
+- `DISCORD_WATCHDOG_WEBHOOK_URL`。
+- `FEISHU_BOT_APP_ID`、`FEISHU_BOT_APP_SECRET`、`FEISHU_BOT_CHAT_ID`。
 
 路径覆盖项包括 `HERMES_HOME`、`WATCHDOG_HOME`、`WATCHDOG_STATE_DIR`、`WATCHDOG_LOG_DIR`、`WATCHDOG_ENV_FILE` 和 `WATCHDOG_DISABLE_FILE`。
 
-私有 env 文件通过 allowlist 解析，不会被当作 shell 脚本 source。Webhook URL 属于 secret，不要提交到 git。
+私有 env 文件通过 allowlist 解析，不会被当作 shell 脚本 source。飞书 bot 凭据属于 secret，不要提交到 git。
 
 ## 告警
 

@@ -46,6 +46,9 @@ test('notify: provider modules use resolved binaries and provider-qualified temp
   assert.match(discord, /\$\{JQ_BIN:-\$\(command -v jq\)\}/);
   assert.match(discord, /notify_body_file="\$\{NOTIFY_OUTPUT_FILE\}\.\$\{provider\}\.body"/);
   assert.match(feishu, /\$\{CURL_BIN:-\$\(command -v curl\)\}/);
+  assert.match(feishu, /\$\{JQ_BIN:-\$\(command -v jq\)\}/);
+  assert.match(feishu, /tenant_access_token\/internal/);
+  assert.match(feishu, /im\/v1\/messages\?receive_id_type=\$\{FEISHU_BOT_RECEIVE_ID_TYPE:-chat_id\}/);
   assert.match(feishu, /notify_err_file="\$\{NOTIFY_OUTPUT_FILE\}\.\$\{provider\}\.err"/);
 });
 
@@ -68,7 +71,7 @@ test('docs: README and Chinese README describe Hermes scope and private env usag
   assert.match(readme, /Hermes Gateway Watchdog/);
   assert.match(readme, /local Hermes Feishu webhook deployment/);
   assert.match(readme, /WATCHDOG_HOME/);
-  assert.match(readme, /Webhook URLs are secrets and should live in the private env file/);
+  assert.match(readme, /Feishu bot credentials are secrets and should live in the private env file/);
   assert.match(readmeZhCN, /Hermes Gateway Watchdog/);
   assert.match(readmeZhCN, /飞书 webhook 部署/);
   assert.match(readmeZhCN, /\[English README\]\(\.\/README\.md\)/);
@@ -95,7 +98,7 @@ test('launchd: plist template uses Hermes label and required placeholders', () =
 test('launchd: install script derives Hermes paths from repo root and default homes', () => {
   assert.match(installLaunchAgent, /REPO_ROOT="\$\(cd "\$SCRIPT_DIR\/\.\." && pwd\)"/);
   assert.match(installLaunchAgent, /HERMES_HOME="\$\{HERMES_HOME:-\$HOME\/\.hermes\}"/);
-  assert.match(installLaunchAgent, /WATCHDOG_HOME="\$\{WATCHDOG_HOME:-\$HOME\/\.hermes-watchdog\}"/);
+  assert.match(installLaunchAgent, /WATCHDOG_HOME="\$\{WATCHDOG_HOME:-\$HERMES_HOME\/watchdog\}"/);
   assert.match(installLaunchAgent, /WATCHDOG_RUNTIME_DIR="\$\{WATCHDOG_RUNTIME_DIR:-\$WATCHDOG_HOME\/runtime\/current\}"/);
   assert.match(installLaunchAgent, /WATCHDOG_ENV_FILE="\$\{WATCHDOG_ENV_FILE:-\$WATCHDOG_HOME\/config\/watchdog\.env\}"/);
   assert.match(installLaunchAgent, /ai\.hermes\.gateway-watchdog/);
@@ -105,10 +108,11 @@ test('launchd: install script stages a local runtime copy, renders plist, and in
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'watchdog-launchd-home-'));
   const fakeBinDir = fs.mkdtempSync(path.join(os.tmpdir(), 'watchdog-launchd-bin-'));
   const callsFile = path.join(tempHome, 'launchctl.calls');
-  const expectedEnvFile = path.join(tempHome, '.hermes-watchdog', 'config', 'watchdog.env');
-  const expectedLogFile = path.join(tempHome, '.hermes-watchdog', 'logs', 'gateway-watchdog.log');
   const expectedHermesHome = path.join(tempHome, '.hermes');
-  const expectedRuntimeDir = path.join(tempHome, '.hermes-watchdog', 'runtime', 'current');
+  const expectedWatchdogHome = path.join(expectedHermesHome, 'watchdog');
+  const expectedEnvFile = path.join(expectedWatchdogHome, 'config', 'watchdog.env');
+  const expectedLogFile = path.join(expectedWatchdogHome, 'logs', 'gateway-watchdog.log');
+  const expectedRuntimeDir = path.join(expectedWatchdogHome, 'runtime', 'current');
   const targetFile = path.join(tempHome, 'Library', 'LaunchAgents', 'ai.hermes.gateway-watchdog.plist');
 
   fs.writeFileSync(
@@ -133,7 +137,7 @@ exit 0
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Installed:/);
   assert.equal(fs.existsSync(targetFile), true);
-  assert.equal(fs.existsSync(path.join(tempHome, '.hermes-watchdog', 'logs')), true);
+  assert.equal(fs.existsSync(path.join(expectedWatchdogHome, 'logs')), true);
   assert.equal(fs.existsSync(path.join(expectedRuntimeDir, 'gateway-watchdog.sh')), true);
   assert.equal(fs.existsSync(path.join(expectedRuntimeDir, 'watchdog-core.sh')), true);
   assert.equal(fs.existsSync(path.join(expectedRuntimeDir, 'notifiers', 'discord.sh')), true);
@@ -198,26 +202,53 @@ printf '204'
   assert.match(log, /INFO notify_ok provider=discord status=204/);
 });
 
-test('notify: feishu notifier records http-status failures against mocked webhook transport', () => {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'watchdog-feishu-notify-'));
-  const fakeBinDir = fs.mkdtempSync(path.join(os.tmpdir(), 'watchdog-feishu-bin-'));
+test('notify: feishu notifier sends text through bot API with tenant token', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'watchdog-feishu-bot-notify-'));
+  const fakeBinDir = fs.mkdtempSync(path.join(os.tmpdir(), 'watchdog-feishu-bot-bin-'));
   const notifyBase = path.join(tempDir, 'notify');
   const logFile = path.join(tempDir, 'watchdog.log');
+  const requestLog = path.join(tempDir, 'requests.log');
 
   fs.writeFileSync(
     path.join(fakeBinDir, 'curl'),
     `#!/usr/bin/env bash
 out_file=""
+data=""
+auth=""
 while (($#)); do
   if [[ "$1" == "-o" ]]; then
     out_file="$2"
     shift 2
     continue
   fi
+  if [[ "$1" == "-d" ]]; then
+    data="$2"
+    shift 2
+    continue
+  fi
+  if [[ "$1" == "-H" && "$2" == Authorization:* ]]; then
+    auth="$2"
+    shift 2
+    continue
+  fi
+  url="$1"
   shift
 done
-printf 'upstream failed\\n' > "$out_file"
-printf '500'
+printf 'url=%s auth=%s data=%s\\n' "$url" "$auth" "$data" >> "${requestLog}"
+case "$url" in
+  */auth/v3/tenant_access_token/internal)
+    printf '{"code":0,"tenant_access_token":"tenant-token"}\\n' > "$out_file"
+    printf '200'
+    ;;
+  */im/v1/messages?receive_id_type=chat_id)
+    printf '{"code":0,"data":{"message_id":"om_test"}}\\n' > "$out_file"
+    printf '200'
+    ;;
+  *)
+    printf '{"code":999,"msg":"unexpected url"}\\n' > "$out_file"
+    printf '404'
+    ;;
+esac
 `,
     { mode: 0o755 },
   );
@@ -227,7 +258,9 @@ printf '500'
       source "${path.join(repoRoot, 'notifiers', 'feishu.sh')}"
       LOG_FILE="${logFile}"
       NOTIFY_OUTPUT_FILE="${notifyBase}"
-      FEISHU_WEBHOOK_URL="https://example.invalid/feishu"
+      FEISHU_BOT_APP_ID="cli_test"
+      FEISHU_BOT_APP_SECRET="secret_test"
+      FEISHU_BOT_CHAT_ID="oc_ops"
       log() { printf '%s %s %s %s\\n' "$1" "$2" "$3" "$4" >> "$LOG_FILE"; }
       if notify_send "hello feishu"; then
         printf 'status=0\\n'
@@ -243,7 +276,12 @@ printf '500'
   );
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /status=1/);
+  assert.match(result.stdout, /status=0/);
   const log = fs.readFileSync(logFile, 'utf8');
-  assert.match(log, /ERROR notify_failed provider=feishu reason=http_status status=500 summary=upstream_failed/);
+  assert.match(log, /INFO notify_ok provider=feishu mode=bot status=200/);
+  const requests = fs.readFileSync(requestLog, 'utf8');
+  assert.match(requests, /auth\/v3\/tenant_access_token\/internal/);
+  assert.match(requests, /im\/v1\/messages\?receive_id_type=chat_id auth=Authorization: Bearer tenant-token/);
+  assert.match(requests, /"receive_id":"oc_ops"/);
+  assert.match(requests, /"content":"\{\\"text\\":\\"hello feishu\\"\}"/);
 });
