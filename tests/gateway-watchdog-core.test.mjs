@@ -77,6 +77,7 @@ test('config precedence: HERMES_HOME and WATCHDOG_HOME derive env, state, and lo
     [
       `WATCHDOG_HOME=${watchdogHome}`,
       'FAIL_THRESHOLD=9',
+      'MAX_RESTART_FAILURES=8',
       'NOTIFIER=feishu',
       '',
     ].join('\n'),
@@ -93,6 +94,7 @@ test('config precedence: HERMES_HOME and WATCHDOG_HOME derive env, state, and lo
         "STATE_FILE=$STATE_FILE" \
         "LOG_FILE=$LOG_FILE" \
         "FAIL_THRESHOLD=$FAIL_THRESHOLD" \
+        "MAX_RESTART_FAILURES=$MAX_RESTART_FAILURES" \
         "NOTIFIER=$NOTIFIER"
     `,
     {
@@ -101,6 +103,7 @@ test('config precedence: HERMES_HOME and WATCHDOG_HOME derive env, state, and lo
         HERMES_HOME: path.join(tempDir, 'hermes'),
         WATCHDOG_ENV_FILE: envFile,
         FAIL_THRESHOLD: '5',
+        MAX_RESTART_FAILURES: '7',
       },
     },
   );
@@ -119,6 +122,7 @@ test('config precedence: HERMES_HOME and WATCHDOG_HOME derive env, state, and lo
     new RegExp(`LOG_FILE=${escapeForRegex(path.join(watchdogHome, 'logs', 'gateway-watchdog.log'))}`),
   );
   assert.match(output, /FAIL_THRESHOLD=5/);
+  assert.match(output, /MAX_RESTART_FAILURES=7/);
   assert.match(output, /NOTIFIER=feishu/);
 });
 
@@ -986,6 +990,80 @@ JSON
   assert.equal(state.consecutive_failures, 2);
   assert.equal(state.cooldown_until_epoch, futureEpoch);
   assert.equal(fs.existsSync(repairFile), false);
+});
+
+test('watchdog_main: stops automatic repair after max restart failures', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-watchdog-restart-limit-'));
+  const stateFile = path.join(tempDir, 'state.json');
+  const repairFile = path.join(tempDir, 'repair.log');
+
+  const output = runBash(`
+    source "${corePath}"
+    load_watchdog_config() {
+      WATCHDOG_ENABLED=1
+      FAIL_THRESHOLD=1
+      MAX_RESTART_FAILURES=2
+      COOLDOWN_SEC=0
+      POST_RESTART_RETRIES=1
+      POST_RESTART_SLEEP_SEC=0
+      INITIAL_GRACE_SEC=0
+      TRANSITION_GRACE_SEC=0
+      WATCHDOG_DISABLE_FILE="${path.join(tempDir, 'disabled')}"
+      WATCHDOG_LOCK_DIR="${path.join(tempDir, 'gateway.lock')}"
+      WATCHDOG_RUNTIME_TMP_DIR="${path.join(tempDir, 'tmp')}"
+      STATE_FILE="${stateFile}"
+      LOG_FILE="${path.join(tempDir, 'watchdog.log')}"
+      GATEWAY_LABEL="com.hermes.gateway"
+      CLOUDFLARED_LABEL="com.cloudflare.cloudflared"
+      NOTIFIER=composite
+    }
+    load_notifier() { :; }
+    notifier_init() { :; }
+    notifier_cleanup() { :; }
+    notify_send() { :; }
+    log() { :; }
+    resolve_required_bins() {
+      CURL_BIN="/usr/bin/curl"
+      JQ_BIN="$(command -v jq)"
+      LAUNCHCTL_BIN="/bin/echo"
+      LSOF_BIN="/usr/sbin/lsof"
+      return 0
+    }
+    get_launchd_pid() { printf '111\\n'; }
+    probe_gateway() {
+      PROBE_STATUS="fail"
+      PROBE_REASON="feishu_not_connected"
+      PROBE_GATEWAY_HEALTH="bad"
+      PROBE_CLOUDFLARED_HEALTH="ok"
+      printf 'fail\\n'
+    }
+    determine_repair_action() { printf 'restart_gateway\\n'; }
+    run_repair_plan() {
+      printf 'repair\\n' >> "${repairFile}"
+      REPAIR_ACTION="restart_gateway"
+      REPAIR_EXECUTED=1
+      RESTART_FAILURE_REASON="recovery_timeout"
+      return 1
+    }
+    load_watchdog_config
+    init_state
+    cat <<JSON | write_state
+{"watchdog_boot_at":"2026-04-17T00:00:00Z","has_seen_ok":true,"consecutive_failures":1,"restart_failures":1,"last_ok_at":"2026-04-17T00:00:00Z","last_failure_at":"","last_restart_at":"","cooldown_until_epoch":0,"initial_grace_until_epoch":0,"transition_grace_until_epoch":0,"transition_reason":"","last_gateway_pid":"111","last_cloudflared_pid":"111","last_reason":"","last_repair_action":""}
+JSON
+    watchdog_main
+    release_lock
+    watchdog_main
+    printf 'repairs=%s\\n' "$(wc -l < "${repairFile}")"
+    cat "${stateFile}"
+  `);
+
+  const lines = output.trim().split('\n');
+  const repairLine = lines.at(-2);
+  const stateJson = lines.at(-1);
+  const state = JSON.parse(stateJson);
+  assert.match(repairLine, /repairs=\s*1$/);
+  assert.equal(state.restart_failures, 2);
+  assert.equal(state.last_repair_action, 'none');
 });
 
 test('watchdog_main: launchctl restart failure does not start cooldown or grace without a restart', () => {

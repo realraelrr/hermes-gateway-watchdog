@@ -251,6 +251,8 @@ load_state_vars() {
   WATCHDOG_BOOT_AT="$(read_state_field '.watchdog_boot_at')"
   HAS_SEEN_OK="$(read_state_field '.has_seen_ok')"
   CONSECUTIVE_FAILURES="$(read_state_field '.consecutive_failures')"
+  RESTART_FAILURES="$(read_state_field '.restart_failures')"
+  [[ "$RESTART_FAILURES" =~ ^-?[0-9]+$ ]] || RESTART_FAILURES=0
   LAST_OK_AT="$(read_state_field '.last_ok_at')"
   LAST_FAILURE_AT="$(read_state_field '.last_failure_at')"
   LAST_RESTART_AT="$(read_state_field '.last_restart_at')"
@@ -266,7 +268,7 @@ load_state_vars() {
 
 persist_state() {
   cat <<JSON | write_state
-{"watchdog_boot_at":"${WATCHDOG_BOOT_AT:-}","has_seen_ok":${HAS_SEEN_OK:-false},"consecutive_failures":${CONSECUTIVE_FAILURES:-0},"last_ok_at":"${LAST_OK_AT:-}","last_failure_at":"${LAST_FAILURE_AT:-}","last_restart_at":"${LAST_RESTART_AT:-}","cooldown_until_epoch":${COOLDOWN_UNTIL_EPOCH:-0},"initial_grace_until_epoch":${INITIAL_GRACE_UNTIL_EPOCH:-0},"transition_grace_until_epoch":${TRANSITION_GRACE_UNTIL_EPOCH:-0},"transition_reason":"${TRANSITION_REASON:-}","last_gateway_pid":"${LAST_GATEWAY_PID:-}","last_cloudflared_pid":"${LAST_CLOUDFLARED_PID:-}","last_reason":"${LAST_REASON:-}","last_repair_action":"${LAST_REPAIR_ACTION:-}"}
+{"watchdog_boot_at":"${WATCHDOG_BOOT_AT:-}","has_seen_ok":${HAS_SEEN_OK:-false},"consecutive_failures":${CONSECUTIVE_FAILURES:-0},"restart_failures":${RESTART_FAILURES:-0},"last_ok_at":"${LAST_OK_AT:-}","last_failure_at":"${LAST_FAILURE_AT:-}","last_restart_at":"${LAST_RESTART_AT:-}","cooldown_until_epoch":${COOLDOWN_UNTIL_EPOCH:-0},"initial_grace_until_epoch":${INITIAL_GRACE_UNTIL_EPOCH:-0},"transition_grace_until_epoch":${TRANSITION_GRACE_UNTIL_EPOCH:-0},"transition_reason":"${TRANSITION_REASON:-}","last_gateway_pid":"${LAST_GATEWAY_PID:-}","last_cloudflared_pid":"${LAST_CLOUDFLARED_PID:-}","last_reason":"${LAST_REASON:-}","last_repair_action":"${LAST_REPAIR_ACTION:-}"}
 JSON
 }
 
@@ -372,6 +374,7 @@ watchdog_main() {
     ok)
       HAS_SEEN_OK=true
       CONSECUTIVE_FAILURES=0
+      RESTART_FAILURES=0
       LAST_OK_AT="$now_iso"
       LAST_REASON="ok"
       LAST_REPAIR_ACTION=""
@@ -399,6 +402,13 @@ watchdog_main() {
     return 0
   fi
 
+  if (( ${MAX_RESTART_FAILURES:-10} > 0 && RESTART_FAILURES >= ${MAX_RESTART_FAILURES:-10} )); then
+    LAST_REPAIR_ACTION="none"
+    log ERROR restart_limit_reached "restart_failures=$RESTART_FAILURES max_restart_failures=${MAX_RESTART_FAILURES:-10} reason=$LAST_REASON"
+    persist_state
+    return 0
+  fi
+
   incident_reason="$PROBE_REASON"
   LAST_REPAIR_ACTION="$(determine_repair_action)"
   incident_action="$LAST_REPAIR_ACTION"
@@ -414,10 +424,12 @@ watchdog_main() {
   if (( repair_rc == 0 )); then
     HAS_SEEN_OK=true
     CONSECUTIVE_FAILURES=0
+    RESTART_FAILURES=0
     LAST_OK_AT="$(state_now_iso)"
     LAST_REASON="ok"
     notify_send "$(format_notification restart_succeeded 0 "$incident_reason" "$incident_action")" || true
   else
+    RESTART_FAILURES=$((RESTART_FAILURES + 1))
     repair_reason="${RESTART_FAILURE_REASON:-$incident_reason}"
     LAST_REASON="$repair_reason"
     if [[ "$LAST_REASON" == "required_tool_missing" || "$LAST_REASON" == "launchctl_restart_failed" ]]; then

@@ -15,7 +15,7 @@ init_state() {
   now_epoch="$(state_now_epoch)"
   mkdir -p "$(dirname "$STATE_FILE")"
   cat > "$STATE_FILE" <<JSON
-{"watchdog_boot_at":"$now_iso","has_seen_ok":false,"consecutive_failures":0,"last_ok_at":"","last_failure_at":"","last_restart_at":"","cooldown_until_epoch":0,"initial_grace_until_epoch":$((now_epoch + INITIAL_GRACE_SEC)),"transition_grace_until_epoch":0,"transition_reason":"","last_gateway_pid":"","last_cloudflared_pid":"","last_reason":"","last_repair_action":""}
+{"watchdog_boot_at":"$now_iso","has_seen_ok":false,"consecutive_failures":0,"restart_failures":0,"last_ok_at":"","last_failure_at":"","last_restart_at":"","cooldown_until_epoch":0,"initial_grace_until_epoch":$((now_epoch + INITIAL_GRACE_SEC)),"transition_grace_until_epoch":0,"transition_reason":"","last_gateway_pid":"","last_cloudflared_pid":"","last_reason":"","last_repair_action":""}
 JSON
 }
 
@@ -49,6 +49,7 @@ read_state_field_fallback() {
     .watchdog_boot_at) sed -n 's/.*"watchdog_boot_at":"\([^"]*\)".*/\1/p' "$STATE_FILE" | head -n 1 ;;
     .has_seen_ok) sed -n 's/.*"has_seen_ok":\([^,}]*\).*/\1/p' "$STATE_FILE" | head -n 1 | tr -d ' ' ;;
     .consecutive_failures) sed -n 's/.*"consecutive_failures":\([-0-9]*\).*/\1/p' "$STATE_FILE" | head -n 1 ;;
+    .restart_failures) sed -n 's/.*"restart_failures":\([-0-9]*\).*/\1/p' "$STATE_FILE" | head -n 1 ;;
     .last_ok_at) sed -n 's/.*"last_ok_at":"\([^"]*\)".*/\1/p' "$STATE_FILE" | head -n 1 ;;
     .last_failure_at) sed -n 's/.*"last_failure_at":"\([^"]*\)".*/\1/p' "$STATE_FILE" | head -n 1 ;;
     .last_restart_at) sed -n 's/.*"last_restart_at":"\([^"]*\)".*/\1/p' "$STATE_FILE" | head -n 1 ;;
